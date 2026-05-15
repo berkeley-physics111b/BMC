@@ -37,6 +37,7 @@ from tkinter import filedialog, messagebox, ttk
 try:
     from ids_peak import ids_peak
     from ids_peak import ids_peak_ipl_extension
+    from ids_peak_ipl import ids_peak_ipl   # pixel format constants live here
     _IDS_AVAILABLE = True
 except ImportError:
     _IDS_AVAILABLE = False
@@ -102,11 +103,25 @@ class IDSCamera:
 
         self._device    = dm.Devices()[0].OpenDevice(ids_peak.DeviceAccessType_Control)
         self._remote_nm = self._device.RemoteDevice().NodeMaps()[0]
+
+        # Load camera defaults so PayloadSize and pixel format are well-defined
+        try:
+            self._remote_nm.FindNode("UserSetSelector").SetCurrentEntry("Default")
+            self._remote_nm.FindNode("UserSetLoad").Execute()
+            self._remote_nm.FindNode("UserSetLoad").WaitUntilDone()
+        except Exception:
+            pass  # some cameras don't support UserSet – continue anyway
+
         self._data_stream = self._device.DataStreams()[0].OpenDataStream()
-        payload = self._remote_nm.FindNode("PayloadSize").Value()
-        for _ in range(BUFFER_COUNT):
+
+        # Use the SDK's own minimum buffer count (fixes BadAccessException)
+        payload     = self._remote_nm.FindNode("PayloadSize").Value()
+        buf_min     = self._data_stream.NumBuffersAnnouncedMinRequired()
+        buf_count   = max(buf_min, BUFFER_COUNT)
+        for _ in range(buf_count):
             buf = self._data_stream.AllocAndAnnounceBuffer(payload)
             self._data_stream.QueueBuffer(buf)
+
         try:
             self._model = self._remote_nm.FindNode("DeviceModelName").Value()
         except Exception:
