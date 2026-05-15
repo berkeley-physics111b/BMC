@@ -169,7 +169,7 @@ class IDSCamera:
         try:
             buf = self._data_stream.WaitForFinishedBuffer(5000)
             ipl  = ids_peak_ipl_extension.BufferToImage(buf)
-            conv = ipl.ConvertTo(ids_peak_ipl_extension.PixelFormatName_BGR8)
+            conv = ipl.ConvertTo(ids_peak_ipl.PixelFormatName_BGR8) 
             w, h = conv.Width(), conv.Height()
             frame = np.frombuffer(conv.Data(), dtype=np.uint8).reshape(h, w, 3).copy()
             self._data_stream.QueueBuffer(buf)
