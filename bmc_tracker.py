@@ -168,12 +168,24 @@ class IDSCamera:
             return _demo_frame()
         try:
             buf = self._data_stream.WaitForFinishedBuffer(5000)
-            ipl  = ids_peak_ipl_extension.BufferToImage(buf)
-            conv = ipl.ConvertTo(ids_peak_ipl.PixelFormatName_BGR8) 
-            w, h = conv.Width(), conv.Height()
-            frame = np.frombuffer(conv.Data(), dtype=np.uint8).reshape(h, w, 3).copy()
+
+            # Convert buffer → IPL image (still references buffer memory)
+            ipl = ids_peak_ipl_extension.BufferToImage(buf)
+
+            # Convert to BGR8.  ConvertTo allocates a NEW internal buffer so
+            # the result is independent of `buf` and we can re-queue immediately.
+            conv = ipl.ConvertTo(ids_peak_ipl.PixelFormatName_BGR8)
+
+            # Re-queue the transport buffer NOW – conv no longer needs it
             self._data_stream.QueueBuffer(buf)
+
+            # Extract pixels via the Python binding's numpy interface.
+            # get_numpy_1D() returns a flat uint8 view; reshape to (H, W, 3).
+            w, h = conv.Width(), conv.Height()
+            flat  = conv.get_numpy_1D()          # shape (H*W*3,)  dtype uint8
+            frame = flat.reshape(h, w, 3).copy() # copy to own the memory
             return frame
+
         except Exception as e:
             print(f"[WARN] grab_frame: {e}")
             return None
