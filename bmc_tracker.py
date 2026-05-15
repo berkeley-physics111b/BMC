@@ -167,7 +167,7 @@ class IDSCamera:
         if not self.is_real:
             return _demo_frame()
         try:
-            buf = self._data_stream.WaitForFinishedBuffer(1000)
+            buf = self._data_stream.WaitForFinishedBuffer(5000)
             ipl  = ids_peak_ipl_extension.BufferToImage(buf)
             conv = ipl.ConvertTo(ids_peak_ipl_extension.PixelFormatName_BGR8)
             w, h = conv.Width(), conv.Height()
