@@ -252,7 +252,7 @@ def _demo_frame() -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Blob finder  (Berkeley BMC algorithm)
+#  Blob finder  (Based on old algorithm described on website)
 # ─────────────────────────────────────────────────────────────────────────────
 class BlobFinder:
     """
@@ -350,7 +350,7 @@ class BlobFinder:
 # ─────────────────────────────────────────────────────────────────────────────
 class ParticleTracker:
     """
-    Implements the Berkeley BMC nearest-neighbour tracker with per-cluster
+    Implements the BMC nearest-neighbour tracker with per-cluster
     global optimisation (factorial search within small groups).
     """
 
