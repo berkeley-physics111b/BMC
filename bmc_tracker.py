@@ -706,7 +706,7 @@ class BrownianApp(tk.Tk):
         # Pixel-count label anchored bottom-right of the canvas
         self._roi_px_lbl = tk.Label(pt_inner,
                                     text="ROI: 0 × 0 px",
-                                    bg="#00000088", fg="#a6e3a1",
+                                    bg="#111120", fg="#a6e3a1",
                                     font=("Courier New", 8))
         self._roi_px_lbl.place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-4)
 
