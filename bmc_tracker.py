@@ -568,9 +568,10 @@ class BrownianApp(tk.Tk):
         self._subtract_bg   = tk.BooleanVar(value=True)
         self._recording     = tk.BooleanVar(value=False)
 
-        # ROI in the pass-through image (x, y, w, h) normalised to canvas
+        # ROI in the pass-through image (x, y, w, h) normalised [0..1]
         self._roi = [0.15, 0.10, 0.70, 0.80]   # fractions of image
-        self._drag_state = None
+        # ROI drag state: dict with "mode", "ox", "oy" or None
+        self._roi_drag: Optional[dict] = None
 
         # Frame queue (producer → consumer)
         self._frame_q: queue.Queue = queue.Queue(maxsize=2)
@@ -579,6 +580,12 @@ class BrownianApp(tk.Tk):
         # FPS tracking
         self._fps_buf = deque(maxlen=30)
         self._last_t  = time.perf_counter()
+
+        # Elapsed timer (set by "Set Start Time" button)
+        self._t_zero: Optional[float] = None   # wall-clock time of last zero
+
+        # Pixels-per-micron calibration (user-supplied)
+        self._px_per_um = tk.DoubleVar(value=1.0)
 
         # Save directory
         self._save_dir = tk.StringVar(value=str(Path.home() / "Documents"))
@@ -635,39 +642,116 @@ class BrownianApp(tk.Tk):
         tk.Label(title_bar, text="  Brownian Motion Camera  |  Particle Tracker",
                  bg=PNL, fg=ACC,
                  font=("Segoe UI", 11, "bold")).pack(side="left", pady=4)
+        # Elapsed timer label (right side of title bar)
+        self._elapsed_lbl = tk.Label(title_bar, text="T  --:--:--",
+                                     bg=PNL, fg="#f38ba8",
+                                     font=("Courier New", 10, "bold"))
+        self._elapsed_lbl.pack(side="right", padx=16, pady=4)
         self._fps_lbl = tk.Label(title_bar, text="0.0 fps",
                                  bg=PNL, fg=DIM,
                                  font=("Segoe UI", 9))
         self._fps_lbl.pack(side="right", padx=12, pady=4)
 
+        # ── Status bar (bottom, packed before main so it stays pinned) ────
+        self._status_var = tk.StringVar(value="Ready.")
+        status_bar = tk.Label(self, textvariable=self._status_var,
+                              bg="#181825", fg=DIM,
+                              font=("Segoe UI", 8), anchor="w")
+        status_bar.pack(fill="x", side="bottom", padx=6, pady=2)
+
         # ── Main area  (video panels left + control panel right) ──────────
         main = tk.Frame(self, bg=BG)
         main.pack(fill="both", expand=True, padx=6, pady=4)
 
-        # ── Left: two video panels stacked ────────────────────────────────
-        video_frame = tk.Frame(main, bg=BG)
-        video_frame.pack(side="left", fill="both", expand=True)
+        # ════════════════════════════════════════════════════════════════════
+        #  LEFT  –  scrollable video column
+        # ════════════════════════════════════════════════════════════════════
+        vid_outer = tk.Frame(main, bg=BG)
+        vid_outer.pack(side="left", fill="both", expand=True)
 
-        # Pass-through
-        pt_lbl_frame = ttk.LabelFrame(video_frame, text="Pass-Through  (click → move ROI  |  Shift+click → resize)")
+        vid_scroll_y = ttk.Scrollbar(vid_outer, orient="vertical")
+        vid_scroll_y.pack(side="right", fill="y")
+        vid_scroll_x = ttk.Scrollbar(vid_outer, orient="horizontal")
+        vid_scroll_x.pack(side="bottom", fill="x")
+
+        vid_canvas = tk.Canvas(vid_outer, bg=BG, highlightthickness=0,
+                               yscrollcommand=vid_scroll_y.set,
+                               xscrollcommand=vid_scroll_x.set)
+        vid_canvas.pack(side="left", fill="both", expand=True)
+        vid_scroll_y.config(command=vid_canvas.yview)
+        vid_scroll_x.config(command=vid_canvas.xview)
+
+        video_frame = tk.Frame(vid_canvas, bg=BG)
+        _vid_win = vid_canvas.create_window((0, 0), window=video_frame, anchor="nw")
+
+        def _vid_configure(e):
+            vid_canvas.configure(scrollregion=vid_canvas.bbox("all"))
+        video_frame.bind("<Configure>", _vid_configure)
+
+        # ── Pass-through panel ────────────────────────────────────────────
+        pt_lbl_frame = ttk.LabelFrame(
+            video_frame,
+            text="Pass-Through  "
+                 "(drag ROI box to move  |  drag corner handle to resize)")
         pt_lbl_frame.pack(fill="both", expand=True, padx=2, pady=2)
-        self._pt_canvas = tk.Canvas(pt_lbl_frame, width=DISPLAY_W, height=DISPLAY_H,
-                                    bg="black", highlightthickness=0, cursor="crosshair")
-        self._pt_canvas.pack()
-        self._pt_canvas.bind("<Button-1>",        self._roi_move)
-        self._pt_canvas.bind("<Shift-Button-1>",  self._roi_resize)
 
-        # Images window (processed)
-        img_lbl_frame = ttk.LabelFrame(video_frame, text="Images  (top: raw ROI + tracks  |  bottom: post-processed blobs)")
+        # Canvas + pixel-count overlay
+        pt_inner = tk.Frame(pt_lbl_frame, bg="black")
+        pt_inner.pack()
+
+        self._pt_canvas = tk.Canvas(pt_inner, width=DISPLAY_W, height=DISPLAY_H,
+                                    bg="black", highlightthickness=0)
+        self._pt_canvas.pack()
+
+        # Pixel-count label anchored bottom-right of the canvas
+        self._roi_px_lbl = tk.Label(pt_inner,
+                                    text="ROI: 0 × 0 px",
+                                    bg="#00000088", fg="#a6e3a1",
+                                    font=("Courier New", 8))
+        self._roi_px_lbl.place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-4)
+
+        # Mouse bindings for drag-to-move and corner-drag-to-resize
+        self._pt_canvas.bind("<ButtonPress-1>",   self._roi_press)
+        self._pt_canvas.bind("<B1-Motion>",        self._roi_drag_motion)
+        self._pt_canvas.bind("<ButtonRelease-1>",  self._roi_release)
+
+        # ── Images panel ─────────────────────────────────────────────────
+        img_lbl_frame = ttk.LabelFrame(
+            video_frame,
+            text="Images  (top: raw ROI + tracks  |  bottom: post-processed blobs)")
         img_lbl_frame.pack(fill="both", expand=True, padx=2, pady=2)
         self._img_canvas = tk.Canvas(img_lbl_frame, width=DISPLAY_W, height=DISPLAY_H,
                                      bg="black", highlightthickness=0)
         self._img_canvas.pack()
 
-        # ── Right: control panel ───────────────────────────────────────────
-        ctrl = tk.Frame(main, bg=BG, width=300)
-        ctrl.pack(side="right", fill="y", padx=4, pady=0)
-        ctrl.pack_propagate(False)
+        # ════════════════════════════════════════════════════════════════════
+        #  RIGHT  –  scrollable control column
+        # ════════════════════════════════════════════════════════════════════
+        ctrl_outer = tk.Frame(main, bg=BG, width=310)
+        ctrl_outer.pack(side="right", fill="y")
+        ctrl_outer.pack_propagate(False)
+
+        ctrl_scroll = ttk.Scrollbar(ctrl_outer, orient="vertical")
+        ctrl_scroll.pack(side="right", fill="y")
+
+        ctrl_canvas = tk.Canvas(ctrl_outer, bg=BG, highlightthickness=0,
+                                yscrollcommand=ctrl_scroll.set)
+        ctrl_canvas.pack(side="left", fill="both", expand=True)
+        ctrl_scroll.config(command=ctrl_canvas.yview)
+
+        ctrl = tk.Frame(ctrl_canvas, bg=BG)
+        _ctrl_win = ctrl_canvas.create_window((0, 0), window=ctrl, anchor="nw")
+
+        def _ctrl_configure(e):
+            ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox("all"))
+            ctrl_canvas.itemconfig(_ctrl_win, width=ctrl_canvas.winfo_width())
+        ctrl.bind("<Configure>", _ctrl_configure)
+        ctrl_canvas.bind("<Configure>", _ctrl_configure)
+
+        # Mouse-wheel scrolling on the control panel
+        def _ctrl_scroll_wheel(e):
+            ctrl_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        ctrl_canvas.bind_all("<MouseWheel>", _ctrl_scroll_wheel)
 
         # ── Camera controls ────────────────────────────────────────────────
         cam_frame = ttk.LabelFrame(ctrl, text="Camera")
@@ -698,6 +782,26 @@ class BrownianApp(tk.Tk):
         gain_scale.pack(fill="x", padx=8, pady=2)
         self._gain_val_lbl = ttk.Label(cam_frame, text="1.0×")
         self._gain_val_lbl.pack(anchor="e", padx=8)
+
+        # ── Calibration ────────────────────────────────────────────────────
+        cal_frame = ttk.LabelFrame(ctrl, text="Calibration")
+        cal_frame.pack(fill="x", padx=4, pady=4)
+
+        cal_row = tk.Frame(cal_frame, bg=BG)
+        cal_row.pack(fill="x", padx=8, pady=6)
+        ttk.Label(cal_row, text="px / µm :").pack(side="left")
+        vcmd = (self.register(self._validate_float), "%P")
+        self._px_um_entry = ttk.Entry(cal_row, textvariable=self._px_per_um,
+                                      width=8, validate="key",
+                                      validatecommand=vcmd)
+        self._px_um_entry.pack(side="left", padx=6)
+        ttk.Label(cal_row, text="(1 px = {:.3f} µm)".format(
+            1.0 / max(self._px_per_um.get(), 1e-9)
+        ), foreground=DIM).pack(side="left")
+
+        # Update the "1 px = …" label whenever the entry changes
+        self._px_per_um.trace_add("write", self._on_px_um_change)
+        self._px_um_info_lbl = cal_row.winfo_children()[-1]  # last label
 
         # ── Blob finder ────────────────────────────────────────────────────
         blob_frame = ttk.LabelFrame(ctrl, text="Blob Finder")
@@ -743,7 +847,7 @@ class BrownianApp(tk.Tk):
         # ── Statistics readout ─────────────────────────────────────────────
         stats_frame = ttk.LabelFrame(ctrl, text="Statistics")
         stats_frame.pack(fill="x", padx=4, pady=4)
-        self._stats_text = tk.Text(stats_frame, height=6, width=34,
+        self._stats_text = tk.Text(stats_frame, height=8, width=34,
                                    bg="#1a1a28", fg="#a6e3a1",
                                    font=("Courier New", 8),
                                    relief="flat", state="disabled",
@@ -754,7 +858,7 @@ class BrownianApp(tk.Tk):
         data_frame = ttk.LabelFrame(ctrl, text="Data Capture")
         data_frame.pack(fill="x", padx=4, pady=4)
 
-        ttk.Button(data_frame, text="Set Start Time  (zero history)",
+        ttk.Button(data_frame, text="⏱  Set Start Time  (zero elapsed + history)",
                    command=self._set_start_time).pack(fill="x", padx=6, pady=3)
 
         ttk.Checkbutton(data_frame, text="Record Bitmaps",
@@ -772,12 +876,8 @@ class BrownianApp(tk.Tk):
         ttk.Button(data_frame, text="💾  Save Recorded Bitmaps",
                    command=self._save_bitmaps).pack(fill="x", padx=6, pady=2)
 
-        # ── Status bar ─────────────────────────────────────────────────────
-        self._status_var = tk.StringVar(value="Ready.")
-        status_bar = tk.Label(self, textvariable=self._status_var,
-                              bg="#181825", fg=DIM,
-                              font=("Segoe UI", 8), anchor="w")
-        status_bar.pack(fill="x", side="bottom", padx=6, pady=2)
+        # Start the elapsed-time ticker
+        self._tick_elapsed()
 
     def _add_slider(self, parent, label, var, mn, mx, fmt, integer=False):
         ttk.Label(parent, text=label).pack(anchor="w", padx=8, pady=(4, 0))
@@ -876,13 +976,27 @@ class BrownianApp(tk.Tk):
             frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H),
                                interpolation=cv2.INTER_LINEAR)
 
-        # ── Pass-through with ROI box ──────────────────────────────────
+        # ── Pass-through with ROI box + corner handles ─────────────────
         pt_display = frame.copy()
         rx, ry, rw, rh = self._roi_pixels()
+        # Main rectangle
         cv2.rectangle(pt_display,
                       (rx, ry), (rx + rw, ry + rh),
                       C_ROI, 2)
+        # Corner handles (filled squares)
+        hs = 6   # half-size of handle square
+        for kx, ky in [(rx, ry), (rx+rw, ry), (rx, ry+rh), (rx+rw, ry+rh)]:
+            cv2.rectangle(pt_display,
+                          (kx - hs, ky - hs), (kx + hs, ky + hs),
+                          C_ROI, -1)
         self._show_on_canvas(self._pt_canvas, pt_display)
+
+        # Update ROI pixel-count overlay label
+        ppu = self._px_per_um_safe()
+        um_w = rw / ppu
+        um_h = rh / ppu
+        self._roi_px_lbl.config(
+            text=f"ROI: {rw} × {rh} px  ({um_w:.1f} × {um_h:.1f} µm)")
 
         # ── ROI crop ──────────────────────────────────────────────────
         roi_img = frame[ry:ry + rh, rx:rx + rw].copy()
@@ -988,22 +1102,84 @@ class BrownianApp(tk.Tk):
         ry = int(self._roi[1] * DISPLAY_H)
         rw = int(self._roi[2] * DISPLAY_W)
         rh = int(self._roi[3] * DISPLAY_H)
-        # clamp
         rx = max(0, min(rx, DISPLAY_W - rw))
         ry = max(0, min(ry, DISPLAY_H - rh))
         return rx, ry, rw, rh
 
-    def _roi_move(self, e):
-        cx, cy = e.x / DISPLAY_W, e.y / DISPLAY_H
-        hw, hh = self._roi[2] / 2, self._roi[3] / 2
-        self._roi[0] = max(0, min(cx - hw, 1 - self._roi[2]))
-        self._roi[1] = max(0, min(cy - hh, 1 - self._roi[3]))
+    # ── ROI drag-to-move / corner-drag-to-resize ───────────────────────────
+    _CORNER_HIT = 16   # px radius to detect a corner handle
 
-    def _roi_resize(self, e):
-        cx, cy = e.x / DISPLAY_W, e.y / DISPLAY_H
-        x0, y0 = self._roi[0], self._roi[1]
-        self._roi[2] = max(0.05, min(cx - x0, 1.0 - x0))
-        self._roi[3] = max(0.05, min(cy - y0, 1.0 - y0))
+    def _roi_press(self, e):
+        rx, ry, rw, rh = self._roi_pixels()
+        cx, cy = e.x, e.y
+
+        # Check corner handles (bottom-right = resize corner)
+        corners = {
+            "tl": (rx,      ry),
+            "tr": (rx + rw, ry),
+            "bl": (rx,      ry + rh),
+            "br": (rx + rw, ry + rh),
+        }
+        for name, (kx, ky) in corners.items():
+            if abs(cx - kx) < self._CORNER_HIT and abs(cy - ky) < self._CORNER_HIT:
+                self._roi_drag = {"mode": "resize_" + name,
+                                  "ox": cx, "oy": cy,
+                                  "roi0": list(self._roi)}
+                self._pt_canvas.config(cursor="sizing")
+                return
+
+        # Inside the box → move
+        if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+            self._roi_drag = {"mode": "move",
+                              "ox": cx - rx, "oy": cy - ry,
+                              "roi0": list(self._roi)}
+            self._pt_canvas.config(cursor="fleur")
+            return
+
+        self._roi_drag = None
+
+    def _roi_drag_motion(self, e):
+        if self._roi_drag is None:
+            return
+        mode = self._roi_drag["mode"]
+        r0   = self._roi_drag["roi0"]
+
+        if mode == "move":
+            nx = (e.x - self._roi_drag["ox"]) / DISPLAY_W
+            ny = (e.y - self._roi_drag["oy"]) / DISPLAY_H
+            self._roi[0] = max(0.0, min(nx, 1.0 - r0[2]))
+            self._roi[1] = max(0.0, min(ny, 1.0 - r0[3]))
+
+        else:
+            # resize: figure out which corner is being dragged and recompute x,y,w,h
+            fx, fy = e.x / DISPLAY_W, e.y / DISPLAY_H
+            x0, y0, w0, h0 = r0
+            x1_orig, y1_orig = x0 + w0, y0 + h0  # opposite corners
+
+            if "tl" in mode:
+                new_x = max(0.0, min(fx, x1_orig - 0.02))
+                new_y = max(0.0, min(fy, y1_orig - 0.02))
+                self._roi[0] = new_x
+                self._roi[1] = new_y
+                self._roi[2] = x1_orig - new_x
+                self._roi[3] = y1_orig - new_y
+            elif "tr" in mode:
+                new_y = max(0.0, min(fy, y1_orig - 0.02))
+                self._roi[1] = new_y
+                self._roi[2] = max(0.02, min(fx - x0, 1.0 - x0))
+                self._roi[3] = y1_orig - new_y
+            elif "bl" in mode:
+                new_x = max(0.0, min(fx, x1_orig - 0.02))
+                self._roi[0] = new_x
+                self._roi[2] = x1_orig - new_x
+                self._roi[3] = max(0.02, min(fy - y0, 1.0 - y0))
+            elif "br" in mode:
+                self._roi[2] = max(0.02, min(fx - x0, 1.0 - x0))
+                self._roi[3] = max(0.02, min(fy - y0, 1.0 - y0))
+
+    def _roi_release(self, e):
+        self._roi_drag = None
+        self._pt_canvas.config(cursor="")
 
     # ── Blob / track toggle ────────────────────────────────────────────────
     def _on_toggle_blobs(self):
@@ -1024,11 +1200,53 @@ class BrownianApp(tk.Tk):
         self._gain_val_lbl.config(text=f"{val:.2f}×")
         self._camera.set_gain(val)
 
+    # ── Elapsed timer ──────────────────────────────────────────────────────
+    def _tick_elapsed(self):
+        if self._t_zero is not None:
+            elapsed = time.perf_counter() - self._t_zero
+            h  = int(elapsed // 3600)
+            m  = int((elapsed % 3600) // 60)
+            s  = elapsed % 60
+            self._elapsed_lbl.config(text=f"T  {h:02d}:{m:02d}:{s:05.2f}")
+        else:
+            self._elapsed_lbl.config(text="T  --:--:--")
+        self.after(100, self._tick_elapsed)
+
+    # ── px/µm calibration helpers ──────────────────────────────────────────
+    @staticmethod
+    def _validate_float(val: str) -> bool:
+        """Allow entry of any partial float string."""
+        if val == "" or val == "-":
+            return True
+        try:
+            float(val)
+            return True
+        except ValueError:
+            return False
+
+    def _on_px_um_change(self, *_):
+        try:
+            ppu = float(self._px_per_um.get())
+            if ppu > 0:
+                self._px_um_info_lbl.config(
+                    text=f"(1 px = {1.0/ppu:.4f} µm)")
+        except (tk.TclError, ValueError, ZeroDivisionError):
+            pass
+
+    def _px_per_um_safe(self) -> float:
+        """Return the current px/µm value, defaulting to 1.0 on bad input."""
+        try:
+            v = float(self._px_per_um.get())
+            return v if v > 0 else 1.0
+        except (tk.TclError, ValueError):
+            return 1.0
+
     # ── Data capture ───────────────────────────────────────────────────────
     def _set_start_time(self):
+        self._t_zero = time.perf_counter()
         self._tracker.reset()
         self._blob_finder.reset()
-        self._update_status("Start time zeroed – history cleared.")
+        self._update_status("Start time zeroed – elapsed timer and history cleared.")
 
     def _browse_dir(self):
         d = filedialog.askdirectory(initialdir=self._save_dir.get())
@@ -1037,18 +1255,21 @@ class BrownianApp(tk.Tk):
 
     def _save_data(self):
         """
-        Save per-particle trajectory data in Berkeley BMC format:
-        header + per-particle block: count, then x y t dx dy dt dr² Δr²
+        Save per-particle trajectory data in Berkeley BMC format.
+        Columns: x_px y_px x_um y_um time dx_px dy_px dx_um dy_um dt dr2_px dr2_um DisplacementSq_um
         """
         tracks = self._tracker.tracks
         if not tracks:
             messagebox.showwarning("No data", "No particle tracks to save.")
             return
+        ppu = self._px_per_um_safe()
         path = Path(self._save_dir.get()) / f"particle_data_{_ts()}.csv"
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["# x", "y", "time", "dx", "dy", "dt",
-                        "dr^2", "DisplacementSquared"])
+            w.writerow([f"# px_per_um={ppu:.6f}"])
+            w.writerow(["# x_px", "y_px", "x_um", "y_um", "time_s",
+                        "dx_px", "dy_px", "dx_um", "dy_um", "dt_s",
+                        "dr2_px2", "dr2_um2", "DispSq_um2"])
             for pid, p in tracks.items():
                 pos = p.positions
                 if len(pos) < 2:
@@ -1058,14 +1279,21 @@ class BrownianApp(tk.Tk):
                 prev_t, prev_x, prev_y = pos[0]
                 x0, y0 = prev_x, prev_y
                 for i, (t, x, y) in enumerate(pos):
-                    dx   = x - prev_x if i > 0 else 0
-                    dy   = y - prev_y if i > 0 else 0
-                    dt   = t - prev_t if i > 0 else 0
-                    dr2  = dx**2 + dy**2
-                    Δr2  = (x - x0)**2 + (y - y0)**2
-                    w.writerow([f"{x:.3f}", f"{y:.3f}", f"{t:.4f}",
-                                f"{dx:.3f}", f"{dy:.3f}", f"{dt:.4f}",
-                                f"{dr2:.3f}", f"{Δr2:.3f}"])
+                    dx    = x - prev_x if i > 0 else 0.0
+                    dy    = y - prev_y if i > 0 else 0.0
+                    dt    = t - prev_t if i > 0 else 0.0
+                    dr2   = dx**2 + dy**2
+                    Δr2   = (x - x0)**2 + (y - y0)**2
+                    w.writerow([
+                        f"{x:.3f}",         f"{y:.3f}",
+                        f"{x/ppu:.4f}",     f"{y/ppu:.4f}",
+                        f"{t:.4f}",
+                        f"{dx:.3f}",        f"{dy:.3f}",
+                        f"{dx/ppu:.4f}",    f"{dy/ppu:.4f}",
+                        f"{dt:.4f}",
+                        f"{dr2:.3f}",       f"{dr2/ppu**2:.4f}",
+                        f"{Δr2/ppu**2:.4f}",
+                    ])
                     prev_t, prev_x, prev_y = t, x, y
         self._update_status(f"Saved → {path}")
         messagebox.showinfo("Saved", str(path))
@@ -1092,23 +1320,27 @@ class BrownianApp(tk.Tk):
     def _update_stats(self, particles, fps):
         tracked   = [p for p in particles if p.tracked]
         untracked = [p for p in particles if not p.tracked]
+        ppu       = self._px_per_um_safe()   # px / µm
+        # D in px²/s  →  µm²/s  :  divide by ppu²
+        px2_to_um2 = 1.0 / (ppu ** 2)
 
         lines = [
             f"Particles visible : {len(particles)}",
-            f"  Tracked (red)   : {len(tracked)}",
-            f"  Untracked (blue): {len(untracked)}",
+            f"  Tracked         : {len(tracked)}",
+            f"  Untracked       : {len(untracked)}",
+            f"  px/µm           : {ppu:.4f}",
             "",
         ]
-        # Diffusion coefficients for top-3 longest tracks
-        ds = []
+        ds_um = []
         for p in sorted(tracked, key=lambda x: -len(x.positions))[:5]:
-            d = self._tracker.diffusion_coeff(p.pid)
-            if d is not None:
-                ds.append(d)
-                lines.append(f"  P{p.pid:03d}  D={d:.2f} px²/s")
-        if ds:
-            weighted = float(np.mean(ds))
-            lines += ["", f"  ⟨D⟩ = {weighted:.2f} px²/s"]
+            d_px = self._tracker.diffusion_coeff(p.pid)
+            if d_px is not None:
+                d_um = d_px * px2_to_um2
+                ds_um.append(d_um)
+                lines.append(f"  P{p.pid:03d}  D = {d_um:.3f} µm²/s")
+        if ds_um:
+            mean_d = float(np.mean(ds_um))
+            lines += ["", f"  ⟨D⟩ = {mean_d:.3f} µm²/s"]
 
         text = "\n".join(lines)
         self._stats_text.config(state="normal")
