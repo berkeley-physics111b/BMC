@@ -847,12 +847,28 @@ class BrownianApp(tk.Tk):
         # ── Statistics readout ─────────────────────────────────────────────
         stats_frame = ttk.LabelFrame(ctrl, text="Statistics")
         stats_frame.pack(fill="x", padx=4, pady=4)
-        self._stats_text = tk.Text(stats_frame, height=8, width=34,
+
+        # Average D header — always visible above the scrollable area
+        self._avg_d_lbl = tk.Label(stats_frame,
+                                   text="⟨D⟩ = --  µm²/s",
+                                   bg="#0d1117", fg="#f9e2af",
+                                   font=("Courier New", 10, "bold"),
+                                   anchor="center", pady=4)
+        self._avg_d_lbl.pack(fill="x", padx=6, pady=(4, 0))
+
+        # Scrollable text area
+        stats_inner = tk.Frame(stats_frame, bg="#1a1a28")
+        stats_inner.pack(fill="x", padx=6, pady=4)
+        stats_sb = ttk.Scrollbar(stats_inner, orient="vertical")
+        stats_sb.pack(side="right", fill="y")
+        self._stats_text = tk.Text(stats_inner, height=8, width=32,
                                    bg="#1a1a28", fg="#a6e3a1",
                                    font=("Courier New", 8),
                                    relief="flat", state="disabled",
-                                   insertbackground="white")
-        self._stats_text.pack(padx=6, pady=4, fill="x")
+                                   insertbackground="white",
+                                   yscrollcommand=stats_sb.set)
+        self._stats_text.pack(side="left", fill="x", expand=True)
+        stats_sb.config(command=self._stats_text.yview)
 
         # ── Data capture ───────────────────────────────────────────────────
         data_frame = ttk.LabelFrame(ctrl, text="Data Capture")
@@ -1315,39 +1331,50 @@ class BrownianApp(tk.Tk):
         self._recorded_frames.clear()
         self._update_status(f"Saved {i+1} frames → {folder}")
         messagebox.showinfo("Saved", str(folder))
-
-    # ── Statistics panel ───────────────────────────────────────────────────
+    # ── Statistics panel ──────────────────────────────────────────────
     def _update_stats(self, particles, fps):
-        tracked   = [p for p in particles if p.tracked]
-        untracked = [p for p in particles if not p.tracked]
-        ppu       = self._px_per_um_safe()   # px / µm
-        # D in px²/s  →  µm²/s  :  divide by ppu²
+        tracked    = [p for p in particles if p.tracked]
+        untracked  = [p for p in particles if not p.tracked]
+        ppu        = self._px_per_um_safe()
         px2_to_um2 = 1.0 / (ppu ** 2)
 
-        lines = [
-            f"Particles visible : {len(particles)}",
-            f"  Tracked         : {len(tracked)}",
-            f"  Untracked       : {len(untracked)}",
-            f"  px/µm           : {ppu:.4f}",
-            "",
-        ]
+        # Collect D for every tracked particle with enough history
         ds_um = []
-        for p in sorted(tracked, key=lambda x: -len(x.positions))[:5]:
+        per_particle_lines = []
+        for p in sorted(tracked, key=lambda x: -len(x.positions)):
             d_px = self._tracker.diffusion_coeff(p.pid)
+            n    = len(p.positions)
             if d_px is not None:
                 d_um = d_px * px2_to_um2
                 ds_um.append(d_um)
-                lines.append(f"  P{p.pid:03d}  D = {d_um:.3f} µm²/s")
+                per_particle_lines.append(
+                    f"P{p.pid:03d}  D={d_um:8.3f} µm²/s  n={n}")
+            else:
+                per_particle_lines.append(
+                    f"P{p.pid:03d}  D=      --          n={n}")
+
+        # Update the always-visible average D header label
         if ds_um:
             mean_d = float(np.mean(ds_um))
-            lines += ["", f"  ⟨D⟩ = {mean_d:.3f} µm²/s"]
+            std_d  = float(np.std(ds_um)) if len(ds_um) > 1 else 0.0
+            self._avg_d_lbl.config(
+                text=f"⟨D⟩ = {mean_d:.3f} ± {std_d:.3f}  µm²/s  (n={len(ds_um)})")
+        else:
+            self._avg_d_lbl.config(text="⟨D⟩ = --  µm²/s")
 
-        text = "\n".join(lines)
+        # Scrollable body
+        body = [
+            f"Visible:{len(particles):3d}  Tracked:{len(tracked):3d}  Lost:{len(untracked):3d}",
+            f"px/µm : {ppu:.4f}",
+            "─" * 32,
+        ]
+        body.extend(per_particle_lines)
+
+        text = "\n".join(body)
         self._stats_text.config(state="normal")
         self._stats_text.delete("1.0", "end")
         self._stats_text.insert("end", text)
         self._stats_text.config(state="disabled")
-
     # ── Status bar ─────────────────────────────────────────────────────────
     def _update_status(self, msg):
         self._status_var.set(msg)
