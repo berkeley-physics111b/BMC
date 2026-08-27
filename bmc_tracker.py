@@ -114,13 +114,8 @@ class IDSCamera:
 
         self._data_stream = self._device.DataStreams()[0].OpenDataStream()
 
-        # Use the SDK's own minimum buffer count (fixes BadAccessException)
-        payload     = self._remote_nm.FindNode("PayloadSize").Value()
-        buf_min     = self._data_stream.NumBuffersAnnouncedMinRequired()
-        buf_count   = max(buf_min, BUFFER_COUNT)
-        for _ in range(buf_count):
-            buf = self._data_stream.AllocAndAnnounceBuffer(payload)
-            self._data_stream.QueueBuffer(buf)
+        # Buffers are (re)allocated in start(), since stop() revokes them.
+        self._alloc_buffers()
 
         try:
             self._model = self._remote_nm.FindNode("DeviceModelName").Value()
@@ -135,10 +130,28 @@ class IDSCamera:
     def is_real(self):
         return self._device is not None
 
+    def _alloc_buffers(self):
+        """Announce and queue acquisition buffers on the data stream.
+
+        Must be called every time before acquisition starts, since
+        stop() revokes all announced buffers. Calling this without a
+        matching revoke first (e.g. two starts in a row) would leak
+        buffers, so callers should only invoke it right after opening
+        the data stream or right after stop() has revoked buffers.
+        """
+        payload   = self._remote_nm.FindNode("PayloadSize").Value()
+        buf_min   = self._data_stream.NumBuffersAnnouncedMinRequired()
+        buf_count = max(buf_min, BUFFER_COUNT)
+        for _ in range(buf_count):
+            buf = self._data_stream.AllocAndAnnounceBuffer(payload)
+            self._data_stream.QueueBuffer(buf)
+
     def start(self):
         self._running = True
         if not self.is_real:
             return
+        if not self._data_stream.AnnouncedBuffers():
+            self._alloc_buffers()
         self._remote_nm.FindNode("TLParamsLocked").SetValue(1)
         self._data_stream.StartAcquisition(
             ids_peak.AcquisitionStartMode_Default,
